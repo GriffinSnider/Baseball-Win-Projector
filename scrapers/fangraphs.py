@@ -211,10 +211,15 @@ def _scrape_park_factors_html(season: int) -> pd.DataFrame:
     return max(tables, key=len)
 
 #Crosswalk: FanGrapgs ID -> MLBAM ID
-def build_fg_mlbam_crosswalk(fg_df: pd.DataFrame, mlbam_df: pd.DataFrame) -> pd.DataFrame:
+def build_fg_mlbam_crosswalk(fg_df: pd.DataFrame, mlbam_df: pd.DataFrame,
+                             player_type: str | None = None) -> pd.DataFrame:
     """
     Join FanGraphs data to MLBAM IDs using name + team.
     Returns a crosswalk DataFrame with fg_id, mlbam_id, name, team, match_status.
+
+    player_type: "hitter" or "pitcher" — when set, prefer MLBAM players whose
+                 position matches (P for pitchers, non-P for hitters) to break
+                 ties between same-name players.
     """
 
     def _normalize_name(name: str) -> str:
@@ -241,22 +246,107 @@ def build_fg_mlbam_crosswalk(fg_df: pd.DataFrame, mlbam_df: pd.DataFrame) -> pd.
             return ""
         return str(team).strip().lower()
 
+    # FanGraphs abbreviation → keyword found in MLB API full team names
+    _TEAM_KEYWORDS = {
+        "ari": "diamondbacks", "atl": "braves", "bal": "orioles",
+        "bos": "red sox", "chc": "cubs", "cws": "white sox", "chw": "white sox",
+        "cin": "reds", "cle": "guardians", "col": "rockies",
+        "det": "tigers", "hou": "astros", "kc": "royals", "kcr": "royals",
+        "laa": "angels", "lad": "dodgers", "mia": "marlins",
+        "mil": "brewers", "min": "twins", "nym": "mets",
+        "nyy": "yankees", "oak": "athletics", "ath": "athletics",
+        "phi": "phillies", "pit": "pirates", "sd": "padres", "sdp": "padres",
+        "sf": "giants", "sfg": "giants", "sea": "mariners", "stl": "cardinals",
+        "tb": "rays", "tbr": "rays", "tex": "rangers", "tor": "blue jays",
+        "wsh": "nationals", "wsn": "nationals",
+    }
+
+    def _teams_compatible(fg_team: str, mlbam_team: str) -> bool:
+        """Check if an FG abbreviation maps to an MLBAM full team name."""
+        if not fg_team or not mlbam_team:
+            return False
+        keyword = _TEAM_KEYWORDS.get(fg_team.strip(), "")
+        if not keyword:
+            return False
+        return keyword in mlbam_team
+
     # Build normalized keys
     fg = fg_df[["fg_id", "name", "team"]].copy()
     fg["name_norm"] = fg["name"].apply(_normalize_name)
     fg["team_norm"] = fg["team"].apply(_normalize_team)
 
-    mlbam = mlbam_df[["mlbam_id", "name", "team"]].copy()
+    # Include position from MLBAM roster for disambiguation
+    mlbam_cols = ["mlbam_id", "name", "team"]
+    if "position" in mlbam_df.columns:
+        mlbam_cols.append("position")
+    mlbam = mlbam_df[mlbam_cols].copy()
     mlbam["name_norm"] = mlbam["name"].apply(_normalize_name)
     mlbam["team_norm"] = mlbam["team"].apply(_normalize_team)
 
-    # Pass 1: exact normalized name match
+    # Pass 1: exact normalized name match, with team + position disambiguation
+    merge_cols = ["mlbam_id", "name_norm", "team_norm"]
+    if "position" in mlbam.columns:
+        merge_cols.append("position")
     merged = fg.merge(
-        mlbam[["mlbam_id", "name_norm"]],
+        mlbam[merge_cols].rename(
+            columns={"team_norm": "team_norm_mlbam",
+                      "position": "pos_mlbam"} if "position" in mlbam.columns
+            else {"team_norm": "team_norm_mlbam"}
+        ),
         on="name_norm",
         how="left",
     )
+    # Score team compatibility so same-name players route to the correct mlbam_id
+    merged["_team_score"] = merged.apply(
+        lambda r: int(_teams_compatible(str(r["team_norm"]), str(r["team_norm_mlbam"]))),
+        axis=1,
+    )
+    # Position score: prefer pitchers for pitcher crosswalk, non-pitchers for hitter crosswalk
+    if player_type and "pos_mlbam" in merged.columns:
+        if player_type == "pitcher":
+            merged["_pos_score"] = (merged["pos_mlbam"] == "P").astype(int)
+        else:
+            merged["_pos_score"] = (merged["pos_mlbam"] != "P").astype(int)
+    else:
+        merged["_pos_score"] = 0
+    merged = merged.sort_values(["_team_score", "_pos_score"], ascending=False)
+
+    # Two-phase dedup: first pick best match per fg_id, then resolve
+    # mlbam_id collisions (same mlbam_id claimed by multiple fg_ids).
     merged = merged.drop_duplicates(subset=["fg_id"], keep="first")
+
+    # If an mlbam_id was claimed by multiple fg_ids, give it to the one
+    # with the higher team score and re-attempt the loser(s) via name-only
+    # fallback to remaining unclaimed mlbam_ids.
+    dupe_mlbam = merged.loc[
+        merged["mlbam_id"].notna() & merged["mlbam_id"].duplicated(keep=False)
+    ]
+    if len(dupe_mlbam) > 0:
+        for mid, grp in dupe_mlbam.groupby("mlbam_id"):
+            # Keep the row with the best team score; reset others
+            best_idx = grp["_team_score"].idxmax()
+            loser_idxs = grp.index.difference([best_idx])
+            merged.loc[loser_idxs, "mlbam_id"] = np.nan
+
+        # Re-attempt losers: match by name to any unclaimed mlbam_id
+        claimed_ids = set(merged["mlbam_id"].dropna().astype(int).tolist())
+        unclaimed_mlbam = mlbam[~mlbam["mlbam_id"].isin(claimed_ids)]
+        losers = merged[merged["mlbam_id"].isna()].copy()
+        if len(losers) > 0 and len(unclaimed_mlbam) > 0:
+            rematched = losers[["fg_id", "name_norm", "team_norm"]].merge(
+                unclaimed_mlbam[["mlbam_id", "name_norm"]],
+                on="name_norm",
+                how="left",
+            ).drop_duplicates(subset=["fg_id"], keep="first")
+            remap = rematched.set_index("fg_id")["mlbam_id"].dropna()
+            merged.loc[merged["fg_id"].isin(remap.index), "mlbam_id"] = (
+                merged.loc[merged["fg_id"].isin(remap.index), "fg_id"].map(remap)
+            )
+
+    _drop = ["_team_score", "_pos_score", "team_norm_mlbam"]
+    if "pos_mlbam" in merged.columns:
+        _drop.append("pos_mlbam")
+    merged = merged.drop(columns=[c for c in _drop if c in merged.columns])
 
     matched = merged["mlbam_id"].notna()
 
