@@ -20,7 +20,12 @@ def _get(endpoint: str, params: dict | None = None) -> dict:
 
 # Player Roster
 def get_all_players(season: int = 2025) -> pd.DataFrame:
-    """Return DataFrame of all MLB players for a season"""
+    """Return DataFrame of all MLB players for a season.
+
+    Team assignment uses currentTeam as a default; this gets overridden
+    in get_hitting_stats / get_pitching_stats with the team where the
+    player accumulated the most PA/IP (handles mid-season trades).
+    """
     data = _get(f"/sports/1/players", params={"season": season})
     rows = []
     for p in data.get("people", []):
@@ -54,11 +59,34 @@ def get_hitting_stats(season: int = 2025) -> pd.DataFrame:
             stats_list = p.get("stats", [])
             if not stats_list:
                 continue
-            for split in stats_list[0].get("splits", []):
+            splits = stats_list[0].get("splits", [])
+            # Find the team where this player had the most PA
+            best_team = None
+            best_pa = 0
+            combined_split = None
+            for split in splits:
+                team_name = split.get("team", {}).get("name")
                 s = split.get("stat", {})
-                if not s.get("plateAppearances"):
-                    continue
-                all_rows.append(_parse_hitting(p["id"], s))
+                pa = int(s.get("plateAppearances", 0))
+                if team_name and pa > best_pa:
+                    best_team = team_name
+                    best_pa = pa
+                if not team_name and pa > 0:
+                    combined_split = split  # combined total row
+            # Prefer combined row (traded players); fall back to best per-team row
+            use_split = combined_split
+            if use_split is None:
+                # Non-traded player: only per-team rows exist
+                for split in splits:
+                    if split.get("team", {}).get("name") == best_team:
+                        use_split = split
+                        break
+            if use_split:
+                s = use_split.get("stat", {})
+                if s.get("plateAppearances"):
+                    row = _parse_hitting(p["id"], s)
+                    row["primary_team"] = best_team
+                    all_rows.append(row)
 
     df = pd.DataFrame(all_rows)
     if df.empty:
@@ -107,11 +135,33 @@ def get_pitching_stats(season: int = 2025) -> pd.DataFrame:
             stats_list = p.get("stats", [])
             if not stats_list:
                 continue
-            for split in stats_list[0].get("splits", []):
+            splits = stats_list[0].get("splits", [])
+            # Find the team where this player had the most IP
+            best_team = None
+            best_ip = 0.0
+            combined_split = None
+            for split in splits:
+                team_name = split.get("team", {}).get("name")
                 s = split.get("stat", {})
-                if not s.get("inningsPitched"):
-                    continue
-                all_rows.append(_parse_pitching(p["id"], s))
+                ip = float(s.get("inningsPitched", 0))
+                if team_name and ip > best_ip:
+                    best_team = team_name
+                    best_ip = ip
+                if not team_name and ip > 0:
+                    combined_split = split
+            # Prefer combined row (traded players); fall back to best per-team row
+            use_split = combined_split
+            if use_split is None:
+                for split in splits:
+                    if split.get("team", {}).get("name") == best_team:
+                        use_split = split
+                        break
+            if use_split:
+                s = use_split.get("stat", {})
+                if s.get("inningsPitched"):
+                    row = _parse_pitching(p["id"], s)
+                    row["primary_team"] = best_team
+                    all_rows.append(row)
 
     df = pd.DataFrame(all_rows)
     if df.empty:
